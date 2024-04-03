@@ -730,6 +730,123 @@ namespace WebSocketSharp
       }
     }
 
+    internal static void ReadBytesAsync(
+      this Stream stream,
+      int length,
+      Action<byte[]> completed,
+      Action<Exception> error)
+    {
+      byte[] buff = new byte[length];
+      int offset = 0;
+      int retry = 0;
+      AsyncCallback callback = (AsyncCallback) null;
+      callback = (AsyncCallback) (ar =>
+      {
+        try
+        {
+          int num = stream.EndRead(ar);
+          if (num == 0 && retry < Ext._maxRetry)
+          {
+            ++retry;
+            stream.BeginRead(buff, offset, length, callback, (object) null);
+          }
+          else if (num == 0 || num == length)
+          {
+            if (completed == null)
+              return;
+            completed(buff.SubArray<byte>(0, offset + num));
+          }
+          else
+          {
+            retry = 0;
+            offset += num;
+            length -= num;
+            stream.BeginRead(buff, offset, length, callback, (object) null);
+          }
+        }
+        catch (Exception ex)
+        {
+          if (error == null)
+            return;
+          error(ex);
+        }
+      });
+      try
+      {
+        stream.BeginRead(buff, offset, length, callback, (object) null);
+      }
+      catch (Exception ex)
+      {
+        if (error == null)
+          return;
+        error(ex);
+      }
+    }
+
+    internal static void ReadBytesAsync(
+      this Stream stream,
+      long length,
+      int bufferLength,
+      Action<byte[]> completed,
+      Action<Exception> error)
+    {
+      MemoryStream dest = new MemoryStream();
+      byte[] buff = new byte[bufferLength];
+      int retry = 0;
+      Action<long> read = (Action<long>) null;
+      read = (Action<long>) (len =>
+      {
+        if (len < (long) bufferLength)
+          bufferLength = (int) len;
+        stream.BeginRead(buff, 0, bufferLength, (AsyncCallback) (ar =>
+        {
+          try
+          {
+            int count = stream.EndRead(ar);
+            if (count > 0)
+              dest.Write(buff, 0, count);
+            if (count == 0 && retry < Ext._maxRetry)
+            {
+              ++retry;
+              read(len);
+            }
+            else if (count == 0 || (long) count == len)
+            {
+              if (completed != null)
+              {
+                dest.Close();
+                completed(dest.ToArray());
+              }
+              dest.Dispose();
+            }
+            else
+            {
+              retry = 0;
+              read(len - (long) count);
+            }
+          }
+          catch (Exception ex)
+          {
+            dest.Dispose();
+            if (error == null)
+              return;
+            error(ex);
+          }
+        }), (object) null);
+      });
+      try
+      {
+        read(length);
+      }
+      catch (Exception ex)
+      {
+        dest.Dispose();
+        if (error == null)
+          return;
+        error(ex);
+      }
+    }
+    
     internal static T[] Reverse<T> (this T[] array)
     {
       var len = array.LongLength;

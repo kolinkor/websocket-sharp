@@ -50,6 +50,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using WebSocketSharp.Net;
 using WebSocketSharp.Net.WebSockets;
 
@@ -120,6 +121,8 @@ namespace WebSocketSharp
     private const string                   _version = "13";
     private TimeSpan                       _waitTime;
 
+    private TaskCompletionSource<bool> CloseTask;
+    private TaskCompletionSource<bool> ConnectTask;
     #endregion
 
     #region Internal Fields
@@ -2064,6 +2067,26 @@ namespace WebSocketSharp
         null
       );
     }
+    
+    private Task<bool> sendAsync(Opcode opcode, Stream stream)
+    {
+      TaskCompletionSource<bool> tsc = new TaskCompletionSource<bool>();
+      Func<Opcode, Stream, bool> sender = new Func<Opcode, Stream, bool>(this.send);
+      sender.BeginInvoke(opcode, stream, (AsyncCallback) (ar =>
+      {
+        try
+        {
+          tsc.TrySetResult(sender.EndInvoke(ar));
+        }
+        catch (Exception ex)
+        {
+          this._logger.Error(ex.ToString());
+          this.error("An exception has occurred during the callback for an async send.", ex);
+          tsc.TrySetException(ex);
+        }
+      }), (object) null);
+      return tsc.Task;
+    }
 
     private bool sendBytes (byte[] bytes)
     {
@@ -2993,11 +3016,56 @@ namespace WebSocketSharp
     ///   Closing or Closed.
     ///   </para>
     /// </remarks>
-    public void CloseAsync ()
-    {
-      closeAsync (1005, String.Empty);
-    }
 
+    public Task<bool> CloseAsync()
+    {
+      return Task.Run<bool>((Func<Task<bool>>) (() =>
+      {
+        if (this.CloseTask != null && !this.CloseTask.Task.IsCompleted)
+          return this.CloseTask.Task;
+        if (this.ConnectTask != null && this.ConnectTask.Task.IsCompleted)
+          this.ConnectTask.Task.Wait();
+        this.CloseTask = new TaskCompletionSource<bool>();
+        
+        if (_readyState == WebSocketState.Closing) 
+        {
+          this._logger.Error("The closing is already in progress.");
+          this.CloseTask.TrySetResult(false);
+        }
+
+        if (_readyState == WebSocketState.Closed) 
+        {
+          _logger.Info ("The connection has already been closed.");
+          this.CloseTask.TrySetResult(false);
+        }
+       
+        this.closeAsync(PayloadData.Empty, true, true, false, this.CloseTask);
+        return this.CloseTask.Task;
+      }));
+    }
+    
+    private void closeAsync(
+      PayloadData e,
+      bool send,
+      bool receive,
+      bool received,
+      TaskCompletionSource<bool> closeTask)
+    {
+      Action<PayloadData, bool, bool, bool> closer = new Action<PayloadData, bool, bool, bool>(this.close);
+      closer.BeginInvoke(e, send, receive, received, (AsyncCallback) (ar =>
+      {
+        try
+        {
+          closer.EndInvoke(ar);
+          closeTask?.TrySetResult(true);
+        }
+        catch (Exception ex)
+        {
+          closeTask?.TrySetResult(false);
+        }
+      }), (object) null);
+    }
+    
     /// <summary>
     /// Closes the connection asynchronously with the specified code.
     /// </summary>
@@ -3383,33 +3451,50 @@ namespace WebSocketSharp
     ///   A series of reconnecting has failed.
     ///   </para>
     /// </exception>
-    public void ConnectAsync ()
+    public Task<bool> ConnectAsync()
     {
-      if (!_client) {
-        var msg = "This instance is not a client.";
-        throw new InvalidOperationException (msg);
-      }
+      return Task.Run<bool>((Func<Task<bool>>) (() =>
+      {
+        if (this.ConnectTask != null && !this.ConnectTask.Task.IsCompleted)
+          return this.ConnectTask.Task;
+        
+        this.ConnectTask = new TaskCompletionSource<bool>();
+        
+        if (!_client) {
+          var msg = "This instance is not a client.";
+          this._logger.Error(msg);
+          this.error(msg, (Exception) null);
+          this.ConnectTask.TrySetResult(false);
+        }
 
-      if (_readyState == WebSocketState.Closing) {
-        var msg = "The close process is in progress.";
-        throw new InvalidOperationException (msg);
-      }
+        if (_readyState == WebSocketState.Closing) {
+          var msg = "The close process is in progress.";
+          this._logger.Error(msg);
+          this.error(msg, (Exception) null);
+          this.ConnectTask.TrySetResult(false);
+        }
 
-      if (_retryCountForConnect > _maxRetryCountForConnect) {
-        var msg = "A series of reconnecting has failed.";
-        throw new InvalidOperationException (msg);
-      }
-
-      Func<bool> connector = connect;
-      connector.BeginInvoke (
-        ar => {
-          if (connector.EndInvoke (ar))
-            open ();
-        },
-        null
-      );
+        if (_retryCountForConnect > _maxRetryCountForConnect) {
+          var msg = "A series of reconnecting has failed.";
+          this._logger.Error(msg);
+          this.error(msg, (Exception) null);
+          this.ConnectTask.TrySetResult(false);
+        }
+        
+        Func<bool> connector = new Func<bool>(this.connect);
+        connector.BeginInvoke((AsyncCallback) (ar =>
+        {
+          if (connector.EndInvoke(ar))
+          {
+            this.open();
+            this.ConnectTask.TrySetResult(true);
+          }
+          this.ConnectTask.TrySetResult(false);
+        }), (object) null);
+        return this.ConnectTask.Task;
+      }));
     }
-
+    
     /// <summary>
     /// Sends a ping using the WebSocket connection.
     /// </summary>
@@ -3692,6 +3777,26 @@ namespace WebSocketSharp
       sendAsync (Opcode.Binary, new MemoryStream (data), completed);
     }
 
+    public Task<bool> SendAsync(byte[] data)
+    {
+      if (_readyState != WebSocketState.Open) {
+        var msg = "The current state of the connection is not Open.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        return Task.FromResult<bool>(false);
+      }
+
+      if (data == null)
+      {
+        var msg = "Data parameter is null";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        return Task.FromResult<bool>(false);
+      }
+
+      return this.sendAsync(Opcode.Binary, (Stream)new MemoryStream(data));
+    }
+    
     /// <summary>
     /// Sends the specified file asynchronously using the WebSocket connection.
     /// </summary>
@@ -3809,7 +3914,35 @@ namespace WebSocketSharp
 
       sendAsync (Opcode.Text, new MemoryStream (bytes), completed);
     }
+    
+    public Task<bool> SendAsync(string data)
+    {
+      if (_readyState != WebSocketState.Open) {
+        var msg = "The current state of the connection is not Open.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        return Task.FromResult<bool>(false);
+      }
 
+      if (data == null)
+      {
+        var msg = "Data parameter is null";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        return Task.FromResult<bool>(false);
+      }
+
+      byte[] bytes;
+      if (!data.TryGetUTF8EncodedBytes (out bytes)) {
+        var msg = "It could not be UTF-8-encoded.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        return Task.FromResult<bool>(false);
+      }
+      
+      return this.sendAsync(Opcode.Text, (Stream) new MemoryStream(bytes));
+    }
+    
     /// <summary>
     /// Sends the data from the specified stream asynchronously using
     /// the WebSocket connection.
@@ -3904,6 +4037,60 @@ namespace WebSocketSharp
       sendAsync (Opcode.Binary, new MemoryStream (bytes), completed);
     }
 
+    public Task<bool> SendAsync(Stream stream, int length)
+    {
+      TaskCompletionSource<bool> tsc = new TaskCompletionSource<bool>();
+      
+      if (_readyState != WebSocketState.Open) {
+        var msg = "The current state of the connection is not Open.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        tsc.TrySetException(new Exception(msg));
+      }
+
+      if (stream == null)
+      {
+        var msg = "Stream parameter is null";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        tsc.TrySetException(new Exception(msg));
+      }
+
+      if (!stream.CanRead) {
+        var msg = "It cannot be read.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        tsc.TrySetException(new Exception(msg));
+      }
+
+      if (length < 1) {
+        var msg = "Less than 1.";
+        this._logger.Error(msg);
+        this.error(msg, (Exception) null);
+        tsc.TrySetException(new Exception(msg));
+      }
+      
+      stream.ReadBytesAsync(length, (Action<byte[]>) (data =>
+      {
+        int length1 = data.Length;
+        if (length1 == 0)
+        {
+          this._logger.Error("The data cannot be read from 'stream'.");
+          this.error("An error has occurred in sending data.", (Exception) null);
+          tsc.TrySetException(new Exception("An error has occurred in sending data."));
+        }
+        if (length1 < length)
+          this._logger.Warn(string.Format("The length of the data is less than 'length':\n  expected: {0}\n  actual: {1}", (object) length, (object) length1));
+        tsc.TrySetResult(this.send(Opcode.Binary, (Stream) new MemoryStream(data)));
+      }), (Action<Exception>) (ex =>
+      {
+        this._logger.Error(ex.ToString());
+        this.error("An exception has occurred while sending data.", ex);
+        tsc.TrySetException(ex);
+      }));
+      return tsc.Task;
+    }
+    
     /// <summary>
     /// Sets an HTTP cookie to send with the handshake request.
     /// </summary>
