@@ -42,8 +42,6 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.Diagnostics;
 using System.IO;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -121,8 +119,6 @@ namespace WebSocketSharp
     private const string                   _version = "13";
     private TimeSpan                       _waitTime;
 
-    private TaskCompletionSource<bool> CloseTask;
-    private TaskCompletionSource<bool> ConnectTask;
     #endregion
 
     #region Internal Fields
@@ -2068,24 +2064,18 @@ namespace WebSocketSharp
       );
     }
     
-    private Task<bool> sendAsync(Opcode opcode, Stream stream)
+    private async Task<bool> sendAsync(Opcode opcode, Stream stream)
     {
-      TaskCompletionSource<bool> tsc = new TaskCompletionSource<bool>();
-      Func<Opcode, Stream, bool> sender = new Func<Opcode, Stream, bool>(this.send);
-      sender.BeginInvoke(opcode, stream, (AsyncCallback) (ar =>
+      try
       {
-        try
-        {
-          tsc.TrySetResult(sender.EndInvoke(ar));
-        }
-        catch (Exception ex)
-        {
-          this._logger.Error(ex.ToString());
-          this.error("An exception has occurred during the callback for an async send.", ex);
-          tsc.TrySetException(ex);
-        }
-      }), (object) null);
-      return tsc.Task;
+        return await Task.Run(() => send(opcode, stream));
+      }
+      catch (Exception ex)
+      {
+        this._logger.Error(ex.ToString());
+        this.error("An exception has occurred during the callback for an async send.", ex);
+        throw;
+      }
     }
 
     private bool sendBytes (byte[] bytes)
@@ -3019,14 +3009,6 @@ namespace WebSocketSharp
 
     public Task<bool> CloseAsync()
     {
-      return Task.Run<bool>((Func<Task<bool>>) (() =>
-      {
-        if (this.CloseTask != null && !this.CloseTask.Task.IsCompleted)
-          return this.CloseTask.Task;
-        if (this.ConnectTask != null && this.ConnectTask.Task.IsCompleted)
-          this.ConnectTask.Task.Wait();
-        this.CloseTask = new TaskCompletionSource<bool>();
-        
         if (_readyState == WebSocketState.Closing) 
         {
           this._logger.Error("The closing is already in progress.");
@@ -3039,31 +3021,20 @@ namespace WebSocketSharp
           this.CloseTask.TrySetResult(false);
         }
        
-        this.closeAsync(PayloadData.Empty, true, true, false, this.CloseTask);
-        return this.CloseTask.Task;
-      }));
+        return this.CloseAsync(PayloadData.Empty, true, true, false);
     }
     
-    private void closeAsync(
-      PayloadData e,
-      bool send,
-      bool receive,
-      bool received,
-      TaskCompletionSource<bool> closeTask)
+    private async Task<bool> CloseAsync(PayloadData e, bool send, bool receive, bool received)
     {
-      Action<PayloadData, bool, bool, bool> closer = new Action<PayloadData, bool, bool, bool>(this.close);
-      closer.BeginInvoke(e, send, receive, received, (AsyncCallback) (ar =>
+      try
       {
-        try
-        {
-          closer.EndInvoke(ar);
-          closeTask?.TrySetResult(true);
-        }
-        catch (Exception ex)
-        {
-          closeTask?.TrySetResult(false);
-        }
-      }), (object) null);
+        await Task.Run(() => close(e, send, receive, received));
+        return true;
+      }
+      catch (Exception ex)
+      {
+        return false;
+      }
     }
     
     /// <summary>
@@ -3451,13 +3422,8 @@ namespace WebSocketSharp
     ///   A series of reconnecting has failed.
     ///   </para>
     /// </exception>
-    public Task<bool> ConnectAsync()
+    public async Task<bool> ConnectAsync()
     {
-      return Task.Run<bool>((Func<Task<bool>>) (() =>
-      {
-        if (this.ConnectTask != null && !this.ConnectTask.Task.IsCompleted)
-          return this.ConnectTask.Task;
-        
         this.ConnectTask = new TaskCompletionSource<bool>();
         
         if (!_client) {
@@ -3480,19 +3446,13 @@ namespace WebSocketSharp
           this.error(msg, (Exception) null);
           this.ConnectTask.TrySetResult(false);
         }
-        
-        Func<bool> connector = new Func<bool>(this.connect);
-        connector.BeginInvoke((AsyncCallback) (ar =>
-        {
-          if (connector.EndInvoke(ar))
-          {
-            this.open();
-            this.ConnectTask.TrySetResult(true);
-          }
-          this.ConnectTask.TrySetResult(false);
-        }), (object) null);
-        return this.ConnectTask.Task;
-      }));
+
+        var connected = await Task.Run(connect);
+        if (!connected)
+          return false;
+
+        await Task.Run(open);
+        return true;
     }
     
     /// <summary>
@@ -3940,7 +3900,7 @@ namespace WebSocketSharp
         return Task.FromResult<bool>(false);
       }
       
-      return this.sendAsync(Opcode.Text, (Stream) new MemoryStream(bytes));
+      return sendAsync(Opcode.Text, (Stream) new MemoryStream(bytes));
     }
     
     /// <summary>
