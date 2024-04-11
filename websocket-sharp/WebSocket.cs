@@ -3012,16 +3012,16 @@ namespace WebSocketSharp
         if (_readyState == WebSocketState.Closing) 
         {
           this._logger.Error("The closing is already in progress.");
-          this.CloseTask.TrySetResult(false);
+          return Task.FromResult(false);
         }
 
         if (_readyState == WebSocketState.Closed) 
         {
           _logger.Info ("The connection has already been closed.");
-          this.CloseTask.TrySetResult(false);
+          return Task.FromResult(false);
         }
        
-        return this.CloseAsync(PayloadData.Empty, true, true, false);
+        return CloseAsync(PayloadData.Empty, true, true, false);
     }
     
     private async Task<bool> CloseAsync(PayloadData e, bool send, bool receive, bool received)
@@ -3424,27 +3424,25 @@ namespace WebSocketSharp
     /// </exception>
     public async Task<bool> ConnectAsync()
     {
-        this.ConnectTask = new TaskCompletionSource<bool>();
-        
         if (!_client) {
           var msg = "This instance is not a client.";
           this._logger.Error(msg);
           this.error(msg, (Exception) null);
-          this.ConnectTask.TrySetResult(false);
+          return false;
         }
 
         if (_readyState == WebSocketState.Closing) {
           var msg = "The close process is in progress.";
           this._logger.Error(msg);
           this.error(msg, (Exception) null);
-          this.ConnectTask.TrySetResult(false);
+          return false;
         }
 
         if (_retryCountForConnect > _maxRetryCountForConnect) {
           var msg = "A series of reconnecting has failed.";
           this._logger.Error(msg);
           this.error(msg, (Exception) null);
-          this.ConnectTask.TrySetResult(false);
+          return false;
         }
 
         var connected = await Task.Run(connect);
